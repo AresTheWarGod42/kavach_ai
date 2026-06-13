@@ -1,0 +1,20 @@
+{
+  "autoencoder_type": "dense_v1",
+  "behavior_features": [
+    "keyboard_input_speed",
+    "input_timing_consistency",
+    "input_pause_patterns",
+    "app_switching_frequency",
+    "pin_entry_speed",
+    "session_duration",
+    "handle_similarity_score",
+    "screen_active_time"
+  ],
+  "dropped_behavior_features": {
+    "authentication_attempts": "near_constant_normal_class"
+  },
+  "reconstruction_threshold": 0.9852809309959412,
+  "normal_reconstruction_error_mean": 0.2789907157421112,
+  "fraud_reconstruction_error_mean": 3.7755744457244873,
+  "reconstruction_gap_ratio": 13.53297523066857
+}

@@ -1,0 +1,440 @@
+You are a senior ML engineer and full-stack developer. Your task is to build Kavach.ai — an AI/ML-powered, real-time UPI fraud detection and defense system — for the NPCI UPI Fraud Detection Blue Team Challenge at the Secure AI Software and Systems Hackathon. Build this as one unified, end-to-end working system. Do not ask what to build next. Do not plan phases. Implement everything described below.
+
+PROJECT IDENTITY
+Project Name: Kavach.ai
+Tagline: AI-Powered Real-Time UPI Fraud Shield
+Challenge: NPCI UPI Fraud Detection — Blue Team
+Mission: Develop an AI/ML solution to identify fraudulent transactions in India's Unified Payments Interface (UPI) system and implement defensive measures to protect legitimate transactions.
+Deployment Stack: FastAPI (backend) + React.js (frontend), fully containerized via Docker Compose.
+DATASETS
+You are given exactly two datasets. Treat them as described. There is no separate external test set — you will split each dataset yourself.
+
+Dataset 1 — Supervised Layer (L1 + L2)
+250,000 records. Columns:
+
+transaction_id, timestamp, transaction_type, merchant_category,
+amount (INR), transaction_status, sender_age_group, receiver_age_group,
+sender_state, sender_bank, receiver_bank, device_type, network_type,
+fraud_flag, hour_of_day, day_of_week, is_weekend
+Target column: fraud_flag
+
+Preprocessing instructions:
+
+Parse timestamp into hour_of_day, day_of_week, is_weekend if not already present; drop raw timestamp after extraction.
+Encode all categorical columns (transaction_type, merchant_category, transaction_status, sender_age_group, receiver_age_group, sender_state, sender_bank, receiver_bank, device_type, network_type) using label encoding or target encoding — choose whichever reduces cardinality better per column.
+Drop transaction_id before training (use only as an index).
+Check for and handle nulls, duplicates, and any outlier amounts (cap at 99.9th percentile).
+Address severe class imbalance on fraud_flag using the following pipeline in order:
+SMOTE — primary over-sampling via k-NN interpolation.
+ADASYN — density-adaptive over-sampling near the decision boundary, applied where SMOTE over-smooths.
+Tomek Links removal — post-oversampling cleanup; removes majority samples nearest to minority samples to sharpen the boundary.
+Class weight injection — inject scale_pos_weight into XGBoost and is_unbalance=True into LightGBM as a secondary correction.
+Stratified K-Fold CV — all cross-validation splits must maintain the original class proportion; never let imbalance leak into validation metrics.
+Train/test split:
+
+Perform a temporal split — sort by timestamp (or reconstructed time order), use the first 70% for training, next 15% for validation, and the final 15% as a held-out test set.
+After splitting, export the test split as a downloadable CSV file named kavach_dataset1_test_split.csv. This file must be accessible for download from the dashboard UI and also saved to a /exports directory on the backend.
+Print class distribution statistics for train, validation, and test splits to console at startup.
+Dataset 2 — Deep / Behavioral / Biometric Layer (L3)
+26,393 records. Raw columns (before cleaning):
+
+transaction_id, user_id, merchant_id, amount, timestamp, description,
+device_id, ip_address, location, session_duration, authentication_attempts,
+receiver_account_age, receiver_transaction_history,
+transaction_amount_vs_sender_history, geographic_disparity,
+transaction_time_of_day, merchant_category_code, session_source,
+url_referrer, time_between_link_click_and_transaction, unusual_device_flag,
+unusual_ip_flag, unusual_location_flag, dns_lookup_age, recent_app_installs,
+input_timing_consistency, app_switching_frequency, keyboard_input_speed,
+input_pause_patterns, permissions_granted, screen_active_time,
+geographic_location_vs_ip, background_data_usage,
+recognized_screen_sharing_apps, authentication_attempt_count,
+time_between_otp_generation_and_input, pin_entry_method, pin_entry_speed,
+unusual_transaction_amount_flag, otp_request_frequency,
+otp_request_device_consistency, transaction_velocity, failed_transaction_count,
+authorization_method, transaction_type, request_description,
+request_description_keywords, request_amount_roundness, request_frequency,
+request_acceptance_rate, time_to_respond_to_request, time_pressure_indicators,
+requester_account_age, relationship_to_requester, upi_handle_age,
+handle_similarity_score, handle_contains_official_terms, handle_typo_analysis,
+handle_transaction_history, business_name_match, social_media_presence,
+handle_registration_pattern, handle_to_description_consistency,
+handle_verification_status, is_fraud
+Target column: is_fraud
+
+Column narrowing — keep only these columns for L3 modeling (drop everything else):
+
+transaction_id, user_id, amount, session_duration, authentication_attempts,
+receiver_account_age, receiver_transaction_history,
+transaction_amount_vs_sender_history, geographic_disparity,
+transaction_time_of_day, merchant_category_code,
+time_between_link_click_and_transaction, unusual_device_flag,
+unusual_ip_flag, unusual_location_flag, input_timing_consistency,
+app_switching_frequency, keyboard_input_speed, screen_active_time,
+geographic_location_vs_ip, authentication_attempt_count,
+time_between_otp_generation_and_input, pin_entry_speed,
+unusual_transaction_amount_flag, otp_request_frequency,
+transaction_velocity, failed_transaction_count,
+request_amount_roundness, time_pressure_indicators,
+handle_similarity_score, handle_contains_official_terms,
+handle_typo_analysis, handle_verification_status, is_fraud
+Drop all text/string columns (description, request_description, url_referrer, session_source, ip_address, location, device_id) — these are either free-form text, PII, or too sparse to encode reliably. Drop timestamp after any time-based feature extraction. Drop merchant_id, request_description_keywords, and all handle_* columns except handle_similarity_score, handle_contains_official_terms, handle_typo_analysis, and handle_verification_status.
+
+Preprocessing instructions:
+
+Normalize all continuous features to [0, 1] using MinMaxScaler.
+One-hot encode pin_entry_method, authorization_method, transaction_type if they survived the column filter; otherwise drop them.
+Handle nulls by median imputation for numeric columns.
+Drop duplicates on transaction_id.
+Train/test split:
+
+Use an 80/20 random stratified split (stratify on is_fraud).
+Export the test split as a downloadable CSV file named kavach_dataset2_test_split.csv. Save to /exports directory and expose a download endpoint from the dashboard.
+Print class distribution for train and test splits to console at startup.
+THREE-LAYER DETECTION ARCHITECTURE
+This is the core of Kavach.ai. Every layer is modular, independently testable, and composable into one unified scoring pipeline. Never collapse the layers into a single model.
+
+L1 — Fast Gate (target: < 5ms, in-path, synchronous)
+Purpose: First-pass deterministic filter. Eliminates obvious fraud and obvious clean transactions before any ML is invoked.
+
+Components:
+
+Rule Engine implemented as an in-memory Python dict + Redis BITFIELD for velocity counters:
+Hard blocklist lookup on sender_bank / receiver_bank combos flagged historically.
+Amount ceiling: flag any single transaction above ₹2,00,000 as ESCALATE immediately.
+Velocity rule: if txn_count_1m > 5 per user, flag ESCALATE.
+Weekend + late-night combo (is_weekend = True AND hour_of_day between 01:00–04:00 AND amount > ₹10,000) → ESCALATE.
+Sub-second inter-transaction time clustering: if two transactions from same device_type arrive < 1 second apart → BLOCK (bot detection).
+XGBoost first-pass classifier trained on Dataset 1 with a very low decision threshold (0.2) to maximize recall at L1 — it is better to over-escalate than to miss fraud here.
+L1 Output: One of PASS, BLOCK, or ESCALATE.
+
+PASS → transaction is allowed through, logged for baseline.
+BLOCK → immediate soft-block pending analyst review (never a hard block without review).
+ESCALATE → passes to L2.
+Only ESCALATE transactions reach L2. PASS and BLOCK do not invoke L2 or L3.
+
+L2 — Ensemble Core (target: < 20ms, in-path, synchronous, runs on ESCALATE only)
+Purpose: Probabilistic fraud scoring using an ensemble of three base learners fed into a stacking meta-learner.
+
+Base Learners (all trained on Dataset 1):
+
+XGBoost — primary gradient-boosted tree; use Platt scaling for calibrated probability output.
+LightGBM — leaf-wise growth; acts as a diversity anchor; faster inference than XGBoost.
+Isolation Forest — unsupervised anomaly scorer; anomaly score is independent of fraud labels — this is what catches novel patterns outside the training distribution.
+Stacking Meta-Learner:
+
+A L2-regularized Logistic Regression meta-learner receives: the three base learner output probabilities + velocity features (txn_count_1m, txn_count_5m, txn_count_1h, amount_sum_1h) as meta-features.
+Decision threshold is set at the F2-maximizing operating point on the validation set (β=2, recall-weighted).
+Export all models via ONNX Runtime for inference. Pre-load ONNX models into memory at FastAPI pod startup — zero per-request loading overhead.
+Compute SHAP values for every prediction at or above the Medium tier threshold (score ≥ 0.30). Return SHAP as a structured array in the /score API response JSON.
+L2 Output: P(fraud) ∈ [0,1] + confidence interval + SHAP feature contributions array.
+
+L3 — Deep Behavioral Detector (target: < 2000ms, fully async, post-authorization)
+Purpose: Deep learning + graph-based enrichment using Dataset 2's behavioral and biometric signals. L3 runs out-of-path — it never blocks a transaction in real time. Its output enriches the audit log and feeds the nightly retraining queue.
+
+Components (both trained exclusively on Dataset 2):
+
+LSTM Autoencoder — trained on the sequential behavioral features (session_duration, input_timing_consistency, keyboard_input_speed, app_switching_frequency, screen_active_time, input_pause_patterns, time_between_otp_generation_and_input, pin_entry_speed). High reconstruction error = behavioral anomaly. Anomaly threshold set at 95th percentile of reconstruction error on the training set.
+
+GraphSAGE (via PyTorch Geometric) — construct a transaction graph where user_id and merchant_id are nodes, and transactions are directed edges weighted by amount. GraphSAGE encodes 2-hop neighborhood context into node embeddings. High graph centrality anomaly score (PageRank deviation, clustering coefficient outlier, betweenness centrality spike) indicates a mule account or laundering chain. This is the only layer that can detect coordinated mule ring fraud invisible to per-transaction classifiers.
+
+L3 Output: Reconstruction error score + graph anomaly score. Both are written to the audit log, displayed in the analyst alert queue, and used to trigger the retraining queue. L3 results are also passed into the Flowise LLM narration agent as enrichment context.
+
+FEATURE ENGINEERING
+Build a dedicated, reusable feature computation module (kavach/features.py). All features that can be pre-computed must be written to Redis by an Apache Flink job (or a simulated Flink job using a Python streaming loop for demo). The inference path must only read pre-computed features from Redis — it must never aggregate inline.
+
+Feature groups to compute:
+
+Velocity: txn_count_1m, txn_count_5m, txn_count_1h per user/device; amount_sum_1h; unique_merchant_1h.
+Behavioral Baseline (from Dataset 1): z-score of current amount vs. user 30-day rolling mean/std; hour_of_day percentile vs. historical pattern per user.
+Device signals: is_new_device flag derived from device_type first-seen tracking; device_txn_count.
+Geographic: geographic_disparity (from Dataset 2); unusual_location_flag; geographic_location_vs_ip.
+MCC: merchant_category_code risk tier (1–5 mapping); flag cross-category anomaly.
+Temporal encoding: hour_sin = sin(2π × hour/24), hour_cos = cos(2π × hour/24); is_weekend; day_of_week.
+Biometric / behavioral (Dataset 2 only, used in L3): input_timing_consistency, keyboard_input_speed, app_switching_frequency, screen_active_time, time_between_otp_generation_and_input, pin_entry_speed, otp_request_frequency, transaction_velocity, failed_transaction_count.
+DEFENSE TECHNIQUES — IMPLEMENT ALL OF THESE WITHOUT EXCEPTION
+These are not optional. They are core to the Blue Team challenge and must all be present in the final codebase.
+
+1. Graduated Four-Tier Response Framework
+Never implement binary block-or-pass logic. Every transaction that receives a score must be routed through this framework:
+
+Risk Score
+Tier
+Tier Name
+Action
+0.00–0.30
+1
+Low
+Allow — log to baseline; no user friction
+0.30–0.60
+2
+Medium
+Allow + silent flag + enhanced logging; accumulate evidence
+0.60–0.85
+3
+High
+Step-up auth trigger (UPI PIN re-prompt or OTP) + push to Analyst Alert Queue
+0.85–1.00
+4
+Critical
+Soft-block + user notification + mandatory analyst review before any hard block
+Hard blocks are never applied without analyst confirmation. False positive abuse (triggering FP flags to block legitimate competitors) is contained by requiring human sign-off at the Critical tier.
+
+2. Adversarial Model Hardening
+FGSM (Fast Gradient Sign Method): Apply FGSM perturbations to tabular features during training of the L2 deep components. Perturb features by ε = 0.01 in the direction of the loss gradient, retrain on both original and perturbed samples. This makes the model robust against fraudsters who tune transaction parameters to stay just below detection thresholds.
+Differential Privacy: Apply Google's DP-SGD library (opacus for PyTorch components) to the LSTM Autoencoder training with a target ε = 0.5. This prevents membership inference attacks and ensures compliance with India's DPDP Act 2023.
+Score Calibration: Apply Platt scaling + isotonic regression to L2 ensemble outputs. Any score outside the expected calibration curve at inference time triggers a system audit flag written to the audit log.
+SHAP Gaming Detection: Monitor SHAP feature importance stability across model versions. If the top-5 SHAP features for a stable test cohort shift unexpectedly between versions, trigger a model review alert before promoting the new model to champion.
+3. Concept Drift Handling and Online Learning
+River (Python): Implement a Hoeffding Tree + online logistic regression that continuously updates on incoming labeled transactions (analyst-confirmed labels from the alert queue) without full retraining. This is the always-on incremental learner.
+ADWIN (Adaptive Windowing): Run ADWIN on the fraud rate time-series. When the detected distribution shift exceeds the threshold, push a retraining job to a queue (simulate with a Python queue for demo).
+Nightly Retraining: A scheduled job (Airflow or APScheduler) retrains on a rolling 30-day window. Use MLflow to version models. New model candidates run in shadow mode alongside the champion model — compared on identical scoring requests before promotion.
+Champion-Challenger promotion is gated by: F2 > 0.87, AUC-PR > 0.92, FPR < 0.5%, and SHAP consistency check passing.
+4. API and Infrastructure Defense
+Per-VPA/per-user rate limiting via Redis sliding window. Throttle escalation: after 10 requests/minute, auto-escalate the next request to High tier regardless of score.
+JWT authentication for all microservice-to-microservice API calls. Every internal FastAPI route requires a valid JWT bearer token.
+Meta-level anomaly detection on API call patterns: Track the distribution of /score request feature vectors. If an incoming request's feature vector is a clear outlier in request-space (i.e., someone is probing the model with crafted inputs), flag it and log to the audit trail.
+Circuit breaker: If scoring service P99 latency exceeds 200ms (measured via Prometheus), fall back to L1-only rule-based decision automatically. Auto-recover and re-enable L2 when latency normalizes. Log all circuit breaker events.
+5. Cryptographic Audit Log and Non-Repudiation
+Append-only audit log stored in PostgreSQL. Every scoring decision must write: transaction_id, timestamp, L1_decision, L2_score, tier, shap_top5, analyst_action (if any), model_version.
+Hash chain: Each audit record stores the SHA-256 hash of the previous record's content. This makes the log tamper-evident by construction — any modification to a past record breaks the chain.
+Data provenance tags on all training records: source dataset, ingest timestamp, label origin, SMOTE/ADASYN generation flag. Store in PostgreSQL alongside model registry metadata in MLflow.
+6. Privacy-Preserving Design
+Feature engineering operates exclusively on derived/aggregated signals — never raw PII.
+ip_address, device_id, location, url_referrer are dropped at ingestion and never stored in the feature store or audit log.
+No raw PII ever enters an LLM prompt. All Flowise/n8n prompts use only SHAP values, tier labels, and anonymized aggregate statistics.
+AI AGENT ORCHESTRATION (n8n + Flowise)
+Deploy three agents. All must be functional in the demo, not just scaffolded.
+
+Agent 1 — Alert Narration Agent (Flowise RAG chain)
+
+Triggered on every transaction scoring at tier ≥ 3 (High or Critical).
+Receives: SHAP top-5 features + their values, L2 score, L3 reconstruction error (if available), tier label, and transaction metadata (amount, merchant_category, sender_state, hour_of_day).
+Generates a plain-English analyst case brief. Example output: "This ₹85,000 transaction from Rajasthan is flagged Critical because: (1) the device was first seen 3 minutes ago [SHAP: +0.31], (2) the amount is 14σ above this user's 30-day mean [SHAP: +0.28], (3) the transaction occurred at 2:47 AM on a weekend [SHAP: +0.19], (4) the receiver account is 2 days old [SHAP: +0.17], and (5) OTP was entered in 0.4 seconds [SHAP: +0.12]. Similar pattern detected in 3 prior confirmed fraud cases."
+Temperature = 0. Grounded strictly in retrieved SHAP values and structured data — no hallucination.
+Case brief is displayed in the Analyst Alert Queue panel on the dashboard.
+Agent 2 — Adaptive Rule Agent (n8n workflow)
+
+Triggered when ADWIN detects a drift event OR when recall drops below 0.80 in rolling evaluation.
+An LLM via Flowise analyzes the false-negative cluster (which fraud transactions were missed) and proposes up to 3 new L1 rule candidates in a structured JSON format: {rule_name, condition, expected_recall_gain, risk_of_fp}.
+Proposed rules appear in a dedicated "Pending Rules" panel on the dashboard for analyst approval. Rules are never deployed without human approval. On approval, the rule is hot-loaded into the L1 rule engine without restart.
+Agent 3 — Threat Intelligence Agent (n8n HTTP nodes)
+
+Runs on a configurable polling interval (default: every 6 hours).
+Ingests public fraud VPA blocklists and RBI cybersecurity advisories via n8n HTTP nodes.
+Automatically enriches the L1 blocklist in Redis. Logs all additions with source and timestamp for auditability.
+FULL TECHNOLOGY STACK
+Use exactly these tools. Do not substitute without a comment explaining why.
+
+Layer
+Tool
+ML Training
+scikit-learn, XGBoost, LightGBM, PyTorch
+Imbalance
+imbalanced-learn (SMOTE, ADASYN, Tomek Links)
+Graph ML
+PyTorch Geometric, NetworkX
+Online Learning
+River (Python), ADWIN
+Model Serving
+FastAPI + ONNX Runtime
+Streaming Simulation
+Python async transaction simulator (replaces Kafka for demo)
+Feature Store
+Redis + PostgreSQL
+AI Orchestration
+n8n + Flowise
+Observability
+Prometheus + Grafana
+Frontend Dashboard
+React.js + Recharts + WebSockets
+Experiment Tracking
+MLflow
+Explainability
+SHAP
+Scheduling
+APScheduler (inside FastAPI for demo; Airflow config provided as reference)
+Containerization
+Docker Compose
+Privacy (DP)
+Opacus (PyTorch DP-SGD)
+FASTAPI BACKEND — REQUIRED ENDPOINTS
+All routes (except /health) require JWT bearer token authentication.
+
+POST   /score                  → Accept a transaction JSON, run L1→L2→L3 pipeline, return scored result
+GET    /audit-log              → Return paginated audit log with hash chain verification status
+GET    /metrics/live           → Return live TPS, fraud rate (1m/5m/1h), P99 latency, model version
+GET    /metrics/model          → Return rolling Precision, Recall, F2, AUC-PR, FPR, drift status
+GET    /alerts/queue           → Return analyst alert queue (tier ≥ High), sorted by score descending
+POST   /alerts/{id}/action     → Analyst submits Accept / Reject / Escalate on an alert
+GET    /transactions/feed      → WebSocket endpoint — streams live scored transactions to dashboard
+GET    /exports/dataset1-test  → Download kavach_dataset1_test_split.csv
+GET    /exports/dataset2-test  → Download kavach_dataset2_test_split.csv
+GET    /rules/pending          → Return pending rule proposals from the Adaptive Rule Agent
+POST   /rules/{id}/approve     → Analyst approves a proposed L1 rule — hot-loads into rule engine
+POST   /rules/{id}/reject      → Analyst rejects a proposed L1 rule
+GET    /health                 → Health check (no auth required)
+REACT DASHBOARD — ADMIN PANEL
+Build a professional fraud operations admin dashboard. It is a React.js SPA with WebSocket subscriptions to the scoring event stream. The UI must look like a dark-mode financial admin dashboard — not a generic demo page. Use a consistent dark color scheme with color-coded tier badges (green / amber / orange / red for Low / Medium / High / Critical).
+
+Required panels — all must be present and functional:
+
+1. KPI Strip (top of dashboard, 5-second refresh)
+
+Transactions Per Second (TPS): live count, with a sparkline trend for the last 60 seconds.
+P99 Latency: current end-to-end scoring latency at the 99th percentile in milliseconds, with a red indicator if it exceeds 150ms.
+Fraud Rate: percentage of transactions flagged fraud in the last 1m / 5m / 1h windows, displayed as three separate badges.
+Active Alerts: count of unresolved High + Critical tier transactions awaiting analyst action.
+Model Version: currently active champion model version from MLflow registry.
+Circuit Breaker Status: green (L1+L2 active) or red (L1-only fallback active).
+2. Live Transaction Feed (real-time WebSocket, sub-second)
+
+Scrolling table of the last 500 scored transactions.
+Columns: Transaction ID, Amount (INR), Sender State, Merchant Category, Device Type, Hour, L1 Decision, L2 Score, Tier Badge, Timestamp.
+Tier badge is color-coded: Low = green, Medium = amber, High = orange, Critical = red.
+Clicking any row opens a transaction detail side panel showing full SHAP breakdown.
+3. Risk Score Distribution (1-minute refresh)
+
+Histogram of P(fraud) scores in a sliding 5-minute window using Recharts BarChart.
+Vertical threshold lines at 0.30, 0.60, and 0.85 showing tier boundaries.
+Highlights any spike in the 0.85–1.00 bin.
+4. Fraud Hotspot by State — India Choropleth Map (30-second refresh)
+
+State-level choropleth map of India using react-simple-maps.
+Color intensity encodes fraud rate per state in the last 30 minutes.
+Tooltip on hover shows: state name, fraud count, total transactions, fraud rate %.
+Use actual Indian state GeoJSON.
+5. Analyst Alert Queue (real-time push)
+
+Prioritized list of all unresolved High and Critical tier transactions.
+Each entry shows: Transaction ID, Amount, Tier Badge, L2 Score, Sender State, Timestamp, and an expandable LLM case brief generated by the Flowise Alert Narration Agent.
+Action buttons per entry: Accept (confirm fraud, label goes to retraining), Reject (mark as false positive), Escalate (bump to human supervisor).
+Analyst action is POSTed to /alerts/{id}/action and immediately removes the entry from the queue.
+6. Model Performance Panel (hourly refresh)
+
+Rolling metrics displayed as gauge charts or stat cards: Precision, Recall, F2-Score, AUC-PR, FPR.
+Drift indicator: green (stable) / amber (drift detected, retraining queued) / red (retrain urgently).
+Champion vs. challenger model comparison table if a shadow model is running.
+7. Pending Rules Panel
+
+Lists all rule proposals generated by the Adaptive Rule Agent pending analyst approval.
+Each entry shows: rule name, condition logic, expected recall gain, estimated FP risk.
+Approve / Reject buttons that POST to /rules/{id}/approve or /rules/{id}/reject.
+8. Test Data Export Panel
+
+Two download buttons: "Download Dataset 1 Test Split" and "Download Dataset 2 Test Split".
+These call /exports/dataset1-test and /exports/dataset2-test respectively and trigger a browser file download.
+LIVE TRANSACTION SIMULATOR
+Since Apache Kafka is not available in the demo environment, build a Python async transaction simulator that continuously fires synthetic UPI transactions at the FastAPI /score endpoint at a configurable TPS rate (default: 50 TPS for demo, scalable to 500 TPS). The simulator must:
+
+Generate transactions by sampling from Dataset 1's feature distribution (use fitted KDE or simple column-wise sampling from training data).
+Inject fraud scenarios at a configurable fraud injection rate (default: 3%) including: SIM-swap sequence (device_type changes mid-session + large amount), velocity attack (rapid-fire low-value transactions from same device), mule chain (sequential transfers across multiple sender states), large overnight transfer (is_weekend=True, hour 01–04, amount > ₹1,50,000).
+Each simulated transaction fires a POST to /score and the scored result is broadcast over WebSocket to the dashboard.
+Simulator runs as a background async task started with the FastAPI app.
+PERFORMANCE TARGETS
+Component
+Target
+L1 Rule Engine
+< 5ms P99
+Redis Feature Read
+< 3ms P99
+L2 ONNX Ensemble
+< 20ms P99
+Total In-Path Decision
+< 150ms P99
+L3 (async)
+< 2000ms
+Sustained TPS
+5,000 (production reference)
+Demo TPS
+50–500 (simulator configurable)
+Implement Prometheus metrics exported from all FastAPI routes. Track: request count, request latency histogram, fraud rate counter, circuit breaker state, L1/L2/L3 invocation counts.
+
+EVALUATION METRICS
+Do not report accuracy. Use only:
+
+Metric
+Target
+Precision
+> 0.90
+Recall
+> 0.85 (primary)
+F2-Score (β=2)
+> 0.87
+AUC-PR
+> 0.92
+False Positive Rate
+< 0.5%
+Detection Latency P99
+< 150ms
+Evaluate on the held-out test splits (exported CSVs). Run an adversarial test suite: craft 50 transactions designed to evade detection (low-velocity, within-normal-amount, known device, but fraudulent pattern) and measure what fraction the system catches. Report all metrics to the MLflow experiment tracker and display rolling versions on the Model Performance Panel.
+
+DOCKER COMPOSE DEPLOYMENT
+Provide a complete docker-compose.yml that brings up all of the following services with one docker compose up command:
+
+kavach-api — FastAPI backend (includes simulator, APScheduler, River online learner)
+kavach-frontend — React.js dashboard served via Nginx
+redis — Feature store and rate limiting
+postgres — Transaction store, audit log, feature history
+mlflow — Experiment tracking and model registry
+prometheus — Metrics scraping
+grafana — Ops-facing infra dashboard (pre-configured with Kavach datasources)
+n8n — AI agent workflow orchestration
+flowise — LLM chain serving
+All services must have health checks. The FastAPI service must wait for Redis and Postgres to be healthy before starting. Mount /exports as a shared volume between kavach-api and the host so downloaded CSVs persist.
+
+Provide a README.md that explains: how to run the system, how to access each service (URLs + ports), how to trigger a demo fraud scenario manually, how to download the test splits, and what each dashboard panel shows.
+
+PROJECT STRUCTURE
+Organize the codebase as follows:
+
+kavach-ai/
+├── backend/
+│   ├── kavach/
+│   │   ├── main.py               # FastAPI app entry point
+│   │   ├── config.py             # All config (thresholds, ports, secrets)
+│   │   ├── features.py           # Feature engineering module
+│   │   ├── layers/
+│   │   │   ├── l1_gate.py        # L1 rule engine + XGBoost first pass
+│   │   │   ├── l2_ensemble.py    # L2 stacking ensemble + ONNX serving
+│   │   │   └── l3_deep.py        # L3 LSTM autoencoder + GraphSAGE (async)
+│   │   ├── defense/
+│   │   │   ├── audit_log.py      # Cryptographic hash-chain audit logger
+│   │   │   ├── rate_limiter.py   # Redis sliding window rate limiter
+│   │   │   ├── circuit_breaker.py
+│   │   │   └── drift_detector.py # ADWIN + River online learner
+│   │   ├── agents/
+│   │   │   ├── narration.py      # Flowise alert narration client
+│   │   │   ├── rule_agent.py     # n8n adaptive rule agent client
+│   │   │   └── threat_intel.py   # n8n threat intel enrichment client
+│   │   ├── simulator.py          # Async live transaction simulator
+│   │   ├── routers/
+│   │   │   ├── score.py
+│   │   │   ├── alerts.py
+│   │   │   ├── metrics.py
+│   │   │   ├── exports.py
+│   │   │   └── rules.py
+│   │   └── models/               # ONNX model files + MLflow artifacts
+│   ├── training/
+│   │   ├── train_l1_l2.py        # Full Dataset 1 pipeline: clean → SMOTE → train → ONNX export
+│   │   └── train_l3.py           # Full Dataset 2 pipeline: clean → LSTM autoencoder → GraphSAGE
+│   └── exports/                  # Test split CSVs written here
+├── frontend/
+│   ├── src/
+│   │   ├── components/
+│   │   │   ├── KPIStrip.jsx
+│   │   │   ├── LiveTransactionFeed.jsx
+│   │   │   ├── RiskScoreDistribution.jsx
+│   │   │   ├── FraudHotspotMap.jsx
+│   │   │   ├── AnalystAlertQueue.jsx
+│   │   │   ├── ModelPerformancePanel.jsx
+│   │   │   ├── PendingRulesPanel.jsx
+│   │   │   └── TestDataExport.jsx
+│   │   ├── App.jsx
+│   │   └── index.jsx
+│   └── Dockerfile
+├── docker-compose.yml
+├── prometheus.yml
+└── README.md
+FINAL INSTRUCTION
+Build every component listed above. Every defense technique must be implemented in code — not just described in comments. Every dashboard panel must render real data from the backend — not mock/hardcoded values. The system must start fully with docker compose up and the dashboard must be reachable at http://localhost:3000 within 60 seconds of startup. The FastAPI docs must be reachable at http://localhost:8000/docs. Name this system Kavach.ai in all code, UI labels, API responses, and documentation. save this. check how much has already been done and then proceed further till completion

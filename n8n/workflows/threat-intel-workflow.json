@@ -1,0 +1,74 @@
+{
+  "name": "Kavach Threat Intel Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "GET",
+        "path": "kavach-threat-intel",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "Webhook_ThreatIntel",
+      "name": "Threat Intel Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        220,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const now = new Date().toISOString();\nconst updates = [\n  { sender_bank: 'RISKYBANK_77', receiver_bank: 'RISKYBANK_88', source: 'n8n-threat-intel', timestamp: now },\n  { sender_bank: 'MULEBANK_X', receiver_bank: 'RAPIDPAY_NODE', source: 'n8n-threat-intel', timestamp: now }\n];\nreturn [{ json: { updates } }];"
+      },
+      "id": "Code_ThreatIntel",
+      "name": "Build Intel Update Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{$json}}"
+      },
+      "id": "Respond_ThreatIntel",
+      "name": "Respond Threat Intel",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.2,
+      "position": [
+        820,
+        260
+      ]
+    }
+  ],
+  "connections": {
+    "Threat Intel Webhook": {
+      "main": [
+        [
+          {
+            "node": "Build Intel Update Payload",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Intel Update Payload": {
+      "main": [
+        [
+          {
+            "node": "Respond Threat Intel",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {}
+}

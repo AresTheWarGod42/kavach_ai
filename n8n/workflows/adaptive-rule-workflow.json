@@ -1,0 +1,74 @@
+{
+  "name": "Kavach Adaptive Rule Agent",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "kavach-adaptive-rule",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "Webhook_AdaptiveRule",
+      "name": "Adaptive Rule Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        220,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const input = $json.body || $json;\nconst reason = String(input.reason || 'unknown_reason');\nconst cluster = input.false_negative_cluster || {};\nconst spike = Number(cluster.recent_high_tier || 0);\nconst rules = [\n  {\n    rule_name: 'weekend_new_device_high_amount',\n    condition: 'is_weekend==1 AND is_new_device==1 AND amount>25000',\n    expected_recall_gain: spike > 40 ? 0.06 : 0.03,\n    risk_of_fp: 0.01\n  },\n  {\n    rule_name: 'burst_multi_state_velocity',\n    condition: 'txn_count_5m>8 AND cross_category_anomaly==1',\n    expected_recall_gain: 0.02,\n    risk_of_fp: 0.015\n  },\n  {\n    rule_name: 'otp_speed_anomaly',\n    condition: 'pin_entry_speed<0.5 AND time_between_otp_generation_and_input<1.0',\n    expected_recall_gain: 0.015,\n    risk_of_fp: 0.009\n  }\n];\nreturn [{ json: { reason, rules } }];"
+      },
+      "id": "Code_AdaptiveRule",
+      "name": "Generate Rule Proposals",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        520,
+        260
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{$json}}"
+      },
+      "id": "Respond_AdaptiveRule",
+      "name": "Respond Adaptive Rules",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.2,
+      "position": [
+        820,
+        260
+      ]
+    }
+  ],
+  "connections": {
+    "Adaptive Rule Webhook": {
+      "main": [
+        [
+          {
+            "node": "Generate Rule Proposals",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Generate Rule Proposals": {
+      "main": [
+        [
+          {
+            "node": "Respond Adaptive Rules",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": true,
+  "settings": {}
+}

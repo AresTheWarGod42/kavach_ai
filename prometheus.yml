@@ -1,0 +1,9 @@
+global:
+  scrape_interval: 5s
+
+scrape_configs:
+  - job_name: "kavach-api"
+    metrics_path: /internal/prometheus
+    static_configs:
+      - targets: ["kavach-api:8000"]
+
